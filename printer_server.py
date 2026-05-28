@@ -139,19 +139,75 @@ def _run_ffmpeg(video_url, timeout):
         raise RuntimeError("ffmpeg is not installed")
     return result.stdout or None
 
-def _grab_frame(video_url, timeout=30, attempts=4):
-    """Grab a keyframe, keeping the most complete of N tries.
+# Above this ratio the bottom band is smeared (streaked); clean frames sit well below.
+_STREAK_THRESHOLD = 1.2
 
-    A keyframe torn by UDP packet loss compresses smaller, since lost slices
-    become flat concealment with little detail. Across keyframes of the same
-    near-static print scene the largest is the most intact, so best-of-N by
-    byte size is a cheap way to skip the occasional dropped-slice frame.
+def _frame_gray(jpg, w=128, h=72):
+    """Decode JPEG bytes to a small grayscale buffer via ffmpeg (no numpy/PIL on the Pi).
+    Returns a list of h rows, each bytes of length w, or None."""
+    cmd = [
+        "ffmpeg", "-nostdin", "-loglevel", "quiet",
+        "-i", "pipe:0", "-vf", f"scale={w}:{h},format=gray",
+        "-f", "rawvideo", "pipe:1",
+    ]
+    try:
+        result = subprocess.run(cmd, input=jpg, capture_output=True, timeout=10)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    raw = result.stdout
+    if len(raw) < w * h:
+        return None
+    return [raw[r * w:(r + 1) * w] for r in range(h)]
+
+def _streak_score(jpg, w=128, h=72):
+    """Vertical-streak score for the bottom band (higher = more streaked).
+
+    UDP slice loss makes the H.264 decoder repeat rows, giving vertical smear:
+    low vertical change but sharp horizontal stripes. The ratio of horizontal to
+    vertical adjacent-pixel change spikes for streaked frames and stays low both
+    for clean content and for genuinely flat regions. Returns None if undecodable.
+    """
+    rows = _frame_gray(jpg, w, h)
+    if rows is None:
+        return None
+    r0 = int(h * 0.60)  # bottom 40% — where lost slices land
+    vsum = vcnt = 0
+    for r in range(r0, h):
+        if r == 0:
+            continue
+        prev, cur = rows[r - 1], rows[r]
+        vsum += sum(abs(cur[c] - prev[c]) for c in range(w))
+        vcnt += w
+    hsum = hcnt = 0
+    for r in range(r0, h):
+        cur = rows[r]
+        hsum += sum(abs(cur[c] - cur[c - 1]) for c in range(1, w))
+        hcnt += w - 1
+    band_vert = vsum / vcnt if vcnt else 0.0
+    band_horiz = hsum / hcnt if hcnt else 0.0
+    return band_horiz / (band_vert + 1.0)
+
+def _grab_frame(video_url, timeout=30, attempts=4):
+    """Grab a keyframe, rejecting bottom-streaked frames caused by UDP slice loss.
+
+    Each candidate is scored for vertical smear; the first clean frame is
+    returned, otherwise the least-streaked of N attempts.
     """
     best = None
+    best_score = None
     for _ in range(attempts):
         jpg = _run_ffmpeg(video_url, timeout)
-        if jpg and (best is None or len(jpg) > len(best)):
-            best = jpg
+        if not jpg:
+            continue
+        score = _streak_score(jpg)
+        if score is None:
+            if best is None:        # can't analyze; keep as last-resort fallback
+                best, best_score = jpg, float("inf")
+            continue
+        if score <= _STREAK_THRESHOLD:
+            return jpg              # clean
+        if best_score is None or score < best_score:
+            best, best_score = jpg, score
     if best is None:
         raise RuntimeError(f"ffmpeg produced no frame after {attempts} attempts")
     return best
