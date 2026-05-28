@@ -1,0 +1,5 @@
+# Screenshots use the system `ffmpeg` binary (apt install ffmpeg), not a pip package.
+flask
+websocket-client
+slack-bolt
+requests

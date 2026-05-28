@@ -1,0 +1,15 @@
+[Unit]
+Description=resinBot printer status server (UDP discovery + WebSocket status + HTTP API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+ExecStart=__DIR__/venv/bin/python3 -u __DIR__/printer_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

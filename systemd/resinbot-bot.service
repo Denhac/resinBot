@@ -1,0 +1,18 @@
+[Unit]
+Description=resinBot Slack bot
+# Order after the status server, but only a soft dependency: the bot reports
+# "could not reach the printer server" and recovers on its own if the server restarts.
+After=network-online.target resinbot-server.service
+Wants=network-online.target resinbot-server.service
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+EnvironmentFile=/etc/resinbot/resinbot.env
+ExecStart=__DIR__/venv/bin/python3 -u __DIR__/slack_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
