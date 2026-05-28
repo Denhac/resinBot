@@ -26,10 +26,10 @@ def fetch_printer_statuses():
 def fetch_screenshot(ip):
     """Returns (jpeg_bytes, error_message)."""
     try:
-        # Screenshot capture enables video, waits for an RTSP keyframe, then disables.
-        # The Pi Zero W is single-core, so a frame grab can take a while — must exceed
-        # the server's ffmpeg timeout (90s) plus enable/disable overhead.
-        resp = requests.get(f"{PRINTER_SERVER_URL}/screenshot/{ip}", timeout=120)
+        # Capture enables video, then grabs/scores up to 4 keyframes (rejecting streaked
+        # ones) before disabling. On the single-core Pi a weak-link printer can need
+        # several retries, so this must exceed the server's worst case (4 x 30s + overhead).
+        resp = requests.get(f"{PRINTER_SERVER_URL}/screenshot/{ip}", timeout=180)
         if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
             return resp.content, None
         try:
