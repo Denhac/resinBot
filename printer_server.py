@@ -139,7 +139,7 @@ def _run_ffmpeg(video_url, timeout):
         raise RuntimeError("ffmpeg is not installed")
     return result.stdout or None
 
-def _grab_frame(video_url, timeout=30, attempts=3):
+def _grab_frame(video_url, timeout=30, attempts=4):
     """Grab a keyframe, keeping the most complete of N tries.
 
     A keyframe torn by UDP packet loss compresses smaller, since lost slices
