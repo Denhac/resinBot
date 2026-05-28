@@ -113,13 +113,17 @@ def _send_video_command(ip, mainboard_id, enable):
         except Exception:
             pass
 
-def _grab_frame(video_url, timeout=90):
-    """Grab a single JPEG frame from an RTSP stream using ffmpeg. Returns bytes."""
+def _run_ffmpeg(video_url, timeout):
+    """Grab a single JPEG keyframe via ffmpeg. Returns bytes, or None on failure/timeout."""
     cmd = [
         "ffmpeg",
         "-nostdin",
         "-loglevel", "error",
-        "-rtsp_transport", "udp",  # Elegoo's camera rejects TCP ("Nonmatching transport")
+        "-fflags", "+discardcorrupt",    # drop frames ffmpeg flags as corrupt
+        "-rtsp_transport", "udp",        # Elegoo's camera rejects TCP ("Nonmatching transport")
+        "-buffer_size", "8388608",       # big UDP buffer so a 1080p keyframe burst isn't dropped
+                                         # (needs net.core.rmem_max raised; see install.sh)
+        "-skip_frame", "nokey",          # decode keyframes only: intra-coded, can't smear
         "-i", video_url,
         "-frames:v", "1",
         "-f", "image2",
@@ -130,14 +134,27 @@ def _grab_frame(video_url, timeout=90):
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg timed out grabbing frame")
+        return None
     except FileNotFoundError:
         raise RuntimeError("ffmpeg is not installed")
+    return result.stdout or None
 
-    if result.returncode != 0 or not result.stdout:
-        err = result.stderr.decode("utf-8", "replace").strip()[:300]
-        raise RuntimeError(f"ffmpeg failed: {err or 'no frame captured'}")
-    return result.stdout
+def _grab_frame(video_url, timeout=30, attempts=3):
+    """Grab a keyframe, keeping the most complete of N tries.
+
+    A keyframe torn by UDP packet loss compresses smaller, since lost slices
+    become flat concealment with little detail. Across keyframes of the same
+    near-static print scene the largest is the most intact, so best-of-N by
+    byte size is a cheap way to skip the occasional dropped-slice frame.
+    """
+    best = None
+    for _ in range(attempts):
+        jpg = _run_ffmpeg(video_url, timeout)
+        if jpg and (best is None or len(jpg) > len(best)):
+            best = jpg
+    if best is None:
+        raise RuntimeError(f"ffmpeg produced no frame after {attempts} attempts")
+    return best
 
 def capture_screenshot(ip, mainboard_id):
     """Enable the printer's video stream, grab one frame via ffmpeg, disable. Returns JPEG bytes."""

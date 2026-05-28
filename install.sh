@@ -60,6 +60,14 @@ else
   echo "Created $ENV_FILE — edit it and add your Slack tokens before starting the bot."
 fi
 
+# Raise the UDP receive-buffer ceiling so ffmpeg's large -buffer_size takes effect.
+# The default (~180 KB) is smaller than a 1080p H.264 keyframe burst, so slices get
+# dropped on the slow single-core Pi and screenshots come through streaked.
+SYSCTL_FILE="/etc/sysctl.d/99-resinbot.conf"
+echo "net.core.rmem_max = 8388608" > "$SYSCTL_FILE"
+sysctl -w net.core.rmem_max=8388608 >/dev/null
+echo "Set net.core.rmem_max=8388608 ($SYSCTL_FILE)"
+
 # Render and install unit files with the resolved user + directory.
 for unit in resinbot-server resinbot-bot; do
   sed -e "s|__USER__|$SERVICE_USER|g" -e "s|__DIR__|$DIR|g" \
