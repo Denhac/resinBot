@@ -1,7 +1,6 @@
 import io
 import os
 import requests
-from concurrent.futures import ThreadPoolExecutor
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -204,15 +203,10 @@ def handle_mention(event, say, client):
         header = f":printer: Fetching status for {len(statuses)} printer(s)…"
     say(text=header, thread_ts=parent_ts)
 
-    # Capture screenshots in parallel — each RTSP grab can take several seconds.
-    with ThreadPoolExecutor(max_workers=min(4, len(statuses))) as pool:
-        for _ in pool.map(
-            lambda item: post_printer(
-                client, channel, parent_ts, item[0], item[1], with_screenshot
-            ),
-            statuses.items(),
-        ):
-            pass
+    # Capture serially: the Pi Zero W is single-core, so concurrent ffmpeg decodes
+    # would contend and slow every capture. One printer at a time keeps each fast.
+    for ip, printer in statuses.items():
+        post_printer(client, channel, parent_ts, ip, printer, with_screenshot)
 
 
 if __name__ == "__main__":
