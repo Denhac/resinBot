@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from flask import Flask, jsonify, Response
-from websocket import create_connection
+from websocket import create_connection, WebSocketTimeoutException
 
 app = Flask(__name__)
 
@@ -39,6 +39,7 @@ def discover_printers():
                 if ip not in printers:
                     printers[ip] = {
                         "status": {},
+                        "attributes": {},
                         "ws": None,
                         "mainboard_id": mainboard_id,
                         "name": name,
@@ -52,24 +53,77 @@ def discover_printers():
 
     print(f"Discovery complete. Found {len(printers)} printer(s).")
 
+def _request_payload(mainboard_id, cmd, data=None):
+    """Build an SDCP request envelope. Returns (json_string, request_id)."""
+    request_id = uuid.uuid4().hex
+    payload = json.dumps({
+        "Id": "",
+        "Data": {
+            "Cmd": cmd,
+            "Data": data or {},
+            "RequestID": request_id,
+            "MainboardID": mainboard_id or "",
+            "TimeStamp": int(time.time()),
+            "From": 0,
+        },
+        "Topic": f"sdcp/request/{mainboard_id or ''}",
+    })
+    return payload, request_id
+
 def connect_to_printer(ip):
     try:
         ws = create_connection(f"ws://{ip}:3030/websocket")
+        ws.settimeout(5)
         with printers_lock:
             printers[ip]["ws"] = ws
+            mb = printers[ip].get("mainboard_id")
         print(f"Connected to printer at {ip}")
 
+        # Request attributes (cmd 1) once so /attributes is populated promptly.
+        try:
+            payload, _ = _request_payload(mb, 1)
+            ws.send(payload)
+        except Exception:
+            pass
+
+        last_refresh = 0.0
         while True:
-            message = ws.recv()
+            # Ask the printer to push a fresh status (cmd 0). When idle it emits
+            # attributes rather than status, so without this the live status would
+            # never arrive (or stay stale). Runs on connect and every 30s after.
+            if time.time() - last_refresh > 30:
+                try:
+                    payload, _ = _request_payload(mb, 0)
+                    ws.send(payload)
+                except Exception:
+                    pass
+                last_refresh = time.time()
+
+            try:
+                message = ws.recv()
+            except (WebSocketTimeoutException, socket.timeout):
+                continue
             data = json.loads(message)
-            mainboard_id = (
-                data.get("Data", {}).get("MainboardID")
-                or data.get("MainboardID")
-            )
-            with printers_lock:
-                printers[ip]["status"] = data
-                if mainboard_id:
-                    printers[ip]["mainboard_id"] = mainboard_id
+            topic = data.get("Topic", "")
+
+            # The printer multiplexes message types on one socket. Only treat actual
+            # status messages as status — attributes (cmd 1) would otherwise clobber it.
+            if "status" in topic or "Status" in data:
+                with printers_lock:
+                    printers[ip]["status"] = data
+                    mb_id = data.get("MainboardID") or data.get("Data", {}).get("MainboardID")
+                    if mb_id:
+                        printers[ip]["mainboard_id"] = mb_id
+                        mb = mb_id
+            elif "attributes" in topic or "Attributes" in data:
+                attrs = data.get("Attributes", {})
+                with printers_lock:
+                    printers[ip]["attributes"] = data
+                    if attrs.get("Name"):
+                        printers[ip]["name"] = attrs["Name"]
+                    if attrs.get("MachineName"):
+                        printers[ip]["machine_name"] = attrs["MachineName"]
+            # other topics (response, error, notice) are ignored
     except Exception as e:
         print(f"WebSocket error for {ip}: {e}")
     finally:
@@ -80,23 +134,10 @@ def connect_to_printer(ip):
 
 def _send_video_command(ip, mainboard_id, enable):
     """Send SDCP cmd 386 (enable/disable video stream). Returns the parsed response data."""
-    request_id = uuid.uuid4().hex
-    payload = {
-        "Id": "",
-        "Data": {
-            "Cmd": 386,
-            "Data": {"Enable": 1 if enable else 0},
-            "RequestID": request_id,
-            "MainboardID": mainboard_id or "",
-            "TimeStamp": int(time.time()),
-            "From": 0,
-        },
-        "Topic": f"sdcp/request/{mainboard_id or ''}",
-    }
-
+    payload, request_id = _request_payload(mainboard_id, 386, {"Enable": 1 if enable else 0})
     ws = create_connection(f"ws://{ip}:3030/websocket", timeout=10)
     try:
-        ws.send(json.dumps(payload))
+        ws.send(payload)
         deadline = time.time() + 10
         while time.time() < deadline:
             ws.settimeout(max(0.5, deadline - time.time()))
@@ -234,12 +275,12 @@ def capture_screenshot(ip, mainboard_id):
         except Exception as e:
             print(f"Failed to disable video stream for {ip}: {e}")
 
-def _printer_view(printer):
+def _printer_view(printer, field):
     return {
         "name": printer.get("name"),
         "machine_name": printer.get("machine_name"),
         "mainboard_id": printer.get("mainboard_id"),
-        "status": printer.get("status", {}),
+        field: printer.get(field, {}),
     }
 
 @app.route('/status', methods=['GET'])
@@ -247,7 +288,7 @@ def get_all_status():
     with printers_lock:
         if not printers:
             return jsonify({"error": "No printers discovered"}), 503
-        result = {ip: _printer_view(p) for ip, p in printers.items()}
+        result = {ip: _printer_view(p, "status") for ip, p in printers.items()}
     return jsonify(result)
 
 @app.route('/status/<ip>', methods=['GET'])
@@ -256,9 +297,28 @@ def get_printer_status(ip):
         printer = printers.get(ip)
         if printer is None:
             return jsonify({"error": f"Printer {ip} not found"}), 404
-        view = _printer_view(printer)
+        view = _printer_view(printer, "status")
     if not view["status"]:
         return jsonify({"error": "No status available"}), 503
+    return jsonify(view)
+
+@app.route('/attributes', methods=['GET'])
+def get_all_attributes():
+    with printers_lock:
+        if not printers:
+            return jsonify({"error": "No printers discovered"}), 503
+        result = {ip: _printer_view(p, "attributes") for ip, p in printers.items()}
+    return jsonify(result)
+
+@app.route('/attributes/<ip>', methods=['GET'])
+def get_printer_attributes(ip):
+    with printers_lock:
+        printer = printers.get(ip)
+        if printer is None:
+            return jsonify({"error": f"Printer {ip} not found"}), 404
+        view = _printer_view(printer, "attributes")
+    if not view["attributes"]:
+        return jsonify({"error": "No attributes available"}), 503
     return jsonify(view)
 
 @app.route('/screenshot/<ip>', methods=['GET'])
