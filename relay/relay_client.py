@@ -30,8 +30,8 @@ import time
 
 from relay_common import (
     DISCOVERY_PORT, PROBE, WS_PORT, RTSP_PORT,
-    T_DISCOVER_REQ, T_DISCOVER_REP, T_TCP_OPEN, T_TCP_DATA, T_TCP_CLOSE,
-    T_UDP_DATA, T_PING,
+    T_DISCOVER_REQ, T_DISCOVER_REP, T_STATIC_TARGETS, T_TCP_OPEN, T_TCP_DATA,
+    T_TCP_CLOSE, T_UDP_DATA, T_PING,
     Tunnel, MediaChan, read_frame, parse_chan, media_chan_id, alloc_udp_pair,
     enable_keepalive, split_rtsp, split_head_body, rtsp_method, get_cseq,
     transport_ports, set_client_port, set_server_port, set_source,
@@ -172,7 +172,8 @@ class RelayClient:
         self.iface = args.iface
         self.manage = args.manage_aliases
         self.local_broadcast = args.local_broadcast
-        self.alias_pool, self.prefix = _parse_alias_cidr(args.alias_cidr)
+        self.alias_pool, self.prefix = _parse_alias_cidr(args.alias_cidr) if args.alias_cidr else ([], 24)
+        self.static_maps = _parse_maps(args.map)   # {real_ip: alias or None}
         self.tunnel = None
         self.tunnel_lock = threading.Lock()
         self.channels = {}
@@ -257,6 +258,8 @@ class RelayClient:
     def handle_discover_rep(self, obj):
         req_id = obj.get("req_id")
         ip = obj["ip"]
+        if ip in self.alias_to_real:
+            return         # one of our own alias IPs reflected back — not a printer
         raw = base64.b64decode(obj["raw"])
         alias = self.ensure_alias(ip)
         if alias is None:
@@ -282,13 +285,23 @@ class RelayClient:
             out.close()
 
     # -- alias management -----------------------------------------------------
-    def ensure_alias(self, real_ip):
+    def ensure_alias(self, real_ip, preferred=None):
+        """Map a printer's real IP to an alias (allocating one if needed).
+
+        ``preferred`` pins a specific alias (from an explicit --map); otherwise
+        the next IP from the --alias-cidr pool is used.
+        """
         with self.lock:
             if real_ip in self.real_to_alias:
                 return self.real_to_alias[real_ip]
-            if not self.free_aliases:
+            if preferred is not None:
+                alias = preferred
+                if alias in self.free_aliases:
+                    self.free_aliases.remove(alias)
+            elif self.free_aliases:
+                alias = self.free_aliases.pop(0)
+            else:
                 return None
-            alias = self.free_aliases.pop(0)
             self.real_to_alias[real_ip] = alias
             self.alias_to_real[alias] = real_ip
         if self.manage:
@@ -296,6 +309,12 @@ class RelayClient:
         self._start_listeners(alias)
         print("mapped printer %s -> alias %s" % (real_ip, alias))
         return alias
+
+    def _setup_static_maps(self):
+        """Pin the explicitly-mapped printers at startup (no discovery needed)."""
+        for real_ip, alias in self.static_maps.items():
+            if self.ensure_alias(real_ip, preferred=alias) is None:
+                print("could not map %s: no alias given and pool exhausted" % real_ip)
 
     def _add_alias(self, alias):
         subprocess.run(
@@ -388,6 +407,7 @@ class RelayClient:
 
     # -- tunnel ---------------------------------------------------------------
     def run(self):
+        self._setup_static_maps()        # pin explicit mappings before anything else
         threading.Thread(target=self.discovery_listener, daemon=True).start()
         if self.local_broadcast:
             threading.Thread(target=self.local_broadcast_sniffer, daemon=True).start()
@@ -408,6 +428,13 @@ class RelayClient:
             print("tunnel connected to %s:%d" % (self.server_host, self.server_port))
             with self.tunnel_lock:
                 self.tunnel = Tunnel(conn)
+            if self.static_maps:
+                # Ask the server to unicast-probe our explicit printers so they
+                # land in discovery too (not just reachable via the alias).
+                try:
+                    self.tunnel.send_json(T_STATIC_TARGETS, {"ips": list(self.static_maps)})
+                except OSError:
+                    pass
             threading.Thread(target=self._keepalive, daemon=True).start()
             try:
                 self._tunnel_loop(conn)
@@ -477,6 +504,25 @@ class RelayClient:
             mc.close()
 
 
+def _parse_maps(entries):
+    """Parse ``--map`` values into ``{real_ip: alias or None}``.
+
+    Each value is ``real_ip`` or ``real_ip=alias``, and may be a comma list.
+    """
+    maps = {}
+    for entry in entries or []:
+        for part in entry.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "=" in part:
+                real_ip, alias = part.split("=", 1)
+                maps[real_ip.strip()] = alias.strip()
+            else:
+                maps[part] = None
+    return maps
+
+
 def _parse_udp_probe(pkt):
     """If ``pkt`` (an IPv4 packet) is a UDP SDCP probe, return (src_ip, src_port).
 
@@ -530,20 +576,31 @@ def main():
     ap = argparse.ArgumentParser(description="SDCP printer relay — client-subnet side")
     ap.add_argument("--server", required=True,
                     help="relay_server tunnel address, host:port (e.g. 10.0.0.9:7000)")
-    ap.add_argument("--alias-cidr", required=True,
-                    help="alias IP pool on the local subnet: 'A-B/prefix' range, "
-                         "'ip1,ip2/prefix' list, or single 'ip/prefix'")
+    ap.add_argument("--alias-cidr", default=None,
+                    help="alias IP pool for auto-discovered printers: 'A-B/prefix' "
+                         "range, 'ip1,ip2/prefix' list, or single 'ip/prefix'. "
+                         "Optional if every printer is given with --map=ip=alias.")
+    ap.add_argument("--map", action="append", default=[], metavar="REAL_IP[=ALIAS]",
+                    help="explicitly map a known printer IP to an alias without "
+                         "discovery (repeatable, or comma-separated). With =ALIAS the "
+                         "alias is pinned; without it one is taken from --alias-cidr.")
     ap.add_argument("--iface", default=None,
                     help="local interface for alias IPs (required with --manage-aliases)")
     ap.add_argument("--manage-aliases", action="store_true",
-                    help="add the alias IPs to --iface via 'ip addr add' (needs root)")
+                    help="add the alias IPs to --iface via 'ip addr add' (needs root); "
+                         "removed again on exit")
     ap.add_argument("--local-broadcast", action="store_true",
                     help="also capture SDCP probes sent by software on THIS host "
                          "(needs root). Use when the relay client runs on the same "
                          "box as printer_server.py; sniffs --iface, or all interfaces.")
     args = ap.parse_args()
+    if not args.alias_cidr and not args.map:
+        ap.error("need --alias-cidr (a pool) and/or --map (explicit printers)")
     if args.manage_aliases and not args.iface:
         ap.error("--manage-aliases requires --iface")
+    maps = _parse_maps(args.map)
+    if not args.alias_cidr and any(a is None for a in maps.values()):
+        ap.error("--map without =ALIAS needs --alias-cidr to draw an alias from")
     RelayClient(args).run()
 
 

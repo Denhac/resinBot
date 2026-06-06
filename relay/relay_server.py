@@ -31,6 +31,7 @@ from relay_common import (
     DISCOVERY_PORT, PROBE, RTSP_PORT,
     T_DISCOVER_REQ, T_DISCOVER_REP, T_TCP_OPEN, T_TCP_DATA, T_TCP_CLOSE,
     T_UDP_DATA, T_PING,
+    T_STATIC_TARGETS,
     Tunnel, MediaChan, read_frame, parse_chan, media_chan_id, alloc_udp_pair,
     enable_keepalive, split_rtsp, split_head_body, rtsp_method, get_cseq,
     transport_ports, set_client_port, strip_destination, rewrite_uri_host,
@@ -146,6 +147,7 @@ class RelayServer:
         self.lock = threading.Lock()
         self.cache = {}            # ip -> (raw_reply_bytes, last_seen)
         self.cache_lock = threading.Lock()
+        self.static_targets = set()  # printer IPs to unicast-probe (set by the client)
 
     # -- discovery ------------------------------------------------------------
     def discovery_loop(self):
@@ -162,7 +164,17 @@ class RelayServer:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         sock.settimeout(timeout)
         try:
-            sock.sendto(PROBE, (self.broadcast, DISCOVERY_PORT))
+            try:
+                sock.sendto(PROBE, (self.broadcast, DISCOVERY_PORT))
+            except OSError as exc:
+                print("broadcast probe failed:", exc)
+            # Unicast-probe any explicitly-mapped printers (reachable even when
+            # broadcast can't get to them, e.g. a different subnet on this side).
+            for ip in list(self.static_targets):
+                try:
+                    sock.sendto(PROBE, (ip, DISCOVERY_PORT))
+                except OSError:
+                    pass
             deadline = time.time() + timeout
             while time.time() < deadline:
                 sock.settimeout(max(0.05, deadline - time.time()))
@@ -263,6 +275,11 @@ class RelayServer:
             if typ == T_DISCOVER_REQ:
                 obj = json.loads(body)
                 self.handle_discover_req(obj.get("req_id"))
+            elif typ == T_STATIC_TARGETS:
+                obj = json.loads(body)
+                self.static_targets = set(obj.get("ips", []))
+                # Probe them right away so they're cached before the next request.
+                threading.Thread(target=self._safe_probe, daemon=True).start()
             elif typ == T_TCP_OPEN:
                 obj = json.loads(body)
                 self._open(obj["chan"], obj["ip"], obj["port"])
@@ -298,6 +315,12 @@ class RelayServer:
         with self.lock:
             self.channels[chan] = ch
 
+    def _safe_probe(self):
+        try:
+            self.probe_once(timeout=2.0)
+        except Exception as exc:
+            print("static probe failed:", exc)
+
     def _teardown(self):
         with self.lock:
             chans = list(self.channels.values())
@@ -305,6 +328,7 @@ class RelayServer:
             self.media.clear()
         for ch in chans:
             ch.close()
+        self.static_targets = set()
         self.tunnel = None
 
 

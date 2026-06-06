@@ -35,6 +35,7 @@ PROBE = b"M99999"              # the exact SDCP discovery probe payload
 # --- tunnel frame types ------------------------------------------------------
 T_DISCOVER_REQ = 0x01          # client->server: please (re)broadcast a probe
 T_DISCOVER_REP = 0x02          # server->client: one discovered printer
+T_STATIC_TARGETS = 0x03        # client->server: also unicast-probe these printer IPs
 T_TCP_OPEN = 0x10              # client->server: open a TCP stream to a printer
 T_TCP_DATA = 0x11              # both ways: bytes on a TCP stream
 T_TCP_CLOSE = 0x12             # both ways: a TCP stream ended

@@ -84,6 +84,31 @@ Now point `printer_server.py` at the client subnet as usual and run its
 discovery — the remote printers appear at their alias IPs and status/screenshots
 work end-to-end.
 
+### Mapping printers explicitly, without discovery
+
+When a printer's IP is known and you'd rather not rely on broadcast discovery
+(e.g. broadcast doesn't reach it, or it's on yet another subnet behind the
+server), map it directly with `--map REAL_IP[=ALIAS]`:
+
+```sh
+sudo ./relay_client.py --server 192.168.20.9:7000 --iface eth0 --manage-aliases \
+    --map 192.168.20.41=192.168.1.200 \
+    --map 192.168.20.55=192.168.1.201
+```
+
+Each mapping is pinned at startup, so:
+
+* a client can talk to the printer at its **alias** immediately, with no
+  discovery at all (point any SDCP client straight at `192.168.1.200`); and
+* `relay_client` tells the server to **unicast-probe** those IPs, so the
+  printers also show up in normal discovery (with their real `MainboardID`),
+  letting discovery-based clients like `printer_server.py` find them at the
+  pinned alias too.
+
+`--map` is repeatable and accepts comma-separated lists. Drop the `=ALIAS` to
+draw an alias from the `--alias-cidr` pool instead of pinning one. With every
+printer mapped explicitly, `--alias-cidr` is optional.
+
 ### Which way does the tunnel dial?
 
 `relay_server` listens and `relay_client` dials out, so the client subnet only
