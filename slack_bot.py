@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
@@ -153,6 +154,87 @@ def format_printer_text(ip: str, printer: dict) -> str:
     return "\n".join(lines)
 
 
+# Any of these ask for a camera frame alongside the status.
+SCREENSHOT_KEYWORDS = {"screenshot", "webcam", "cam", "snapshot", "picture"}
+
+# Words that just name the default action; recognized so they aren't mistaken
+# for printer-name filters.
+STATUS_KEYWORDS = {"status", "all"}
+
+HELP_KEYWORDS = {"help", "usage", "commands"}
+
+COMMAND_KEYWORDS = SCREENSHOT_KEYWORDS | STATUS_KEYWORDS | HELP_KEYWORDS
+
+# Slack renders mentions/links/channels as <...> entities; none are printer names.
+_ENTITY_RE = re.compile(r"<[^>]*>")
+# Keep inner dots and dashes so an IP or a hyphenated name survives as one
+# token, but never trailing ones ("left." must still match "saturn4uleft").
+_TOKEN_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
+
+
+def parse_command(text: str):
+    """Split mention text into (show_help, with_screenshot, name_filters).
+
+    Every token that isn't a recognized command keyword is treated as a
+    case-insensitive substring filter on printer names.
+    """
+    body = _ENTITY_RE.sub(" ", text or "").lower()
+    tokens = _TOKEN_RE.findall(body)
+
+    show_help = any(t in HELP_KEYWORDS for t in tokens)
+    with_screenshot = any(t in SCREENSHOT_KEYWORDS for t in tokens)
+
+    filters = []
+    for token in tokens:
+        if token not in COMMAND_KEYWORDS and token not in filters:
+            filters.append(token)
+    return show_help, with_screenshot, filters
+
+
+def _keyword_list(keywords) -> str:
+    return ", ".join(f"`{k}`" for k in sorted(keywords))
+
+
+def help_text() -> str:
+    """Usage summary, generated from the keyword sets so it can't drift."""
+    return "\n".join([
+        ":printer: *resinBot* — mention me with optional keywords.",
+        "",
+        f"*Status* — just mention me (or say {_keyword_list(STATUS_KEYWORDS)}) "
+        "for every printer's status.",
+        f"*Snapshot* — add {_keyword_list(SCREENSHOT_KEYWORDS)} to include a camera frame.",
+        "*Pick printers* — any other word filters by printer name, model, or IP. "
+        "Matching is case-insensitive and partial, and multiple terms are combined "
+        "(any match wins).",
+        f"*Help* — {_keyword_list(HELP_KEYWORDS)}.",
+        "",
+        "_Examples:_",
+        "• `@resinBot` — status for all printers",
+        "• `@resinBot left` — status for printers whose name contains \"left\"",
+        "• `@resinBot cam left right` — snapshots from both printers",
+    ])
+
+
+def matches_filters(ip: str, printer: dict, filters) -> bool:
+    """True if any filter term appears in the printer's name, model, or IP."""
+    if not filters:
+        return True
+    haystack = " ".join(
+        str(v).lower()
+        for v in (printer.get("name"), printer.get("machine_name"), ip)
+        if v
+    )
+    return any(f in haystack for f in filters)
+
+
+def select_printers(statuses: dict, filters) -> dict:
+    return {
+        ip: printer
+        for ip, printer in statuses.items()
+        if matches_filters(ip, printer, filters)
+    }
+
+
 def post_printer(client, channel, thread_ts, ip, printer, with_screenshot):
     text = format_printer_text(ip, printer)
 
@@ -185,7 +267,11 @@ def handle_mention(event, say, client):
     # Reply in-thread if the mention was in a thread, else start a new thread on our header.
     parent_ts = event.get("thread_ts") or event["ts"]
 
-    with_screenshot = "screenshot" in event.get("text", "").lower()
+    show_help, with_screenshot, filters = parse_command(event.get("text", ""))
+
+    if show_help:
+        say(text=help_text(), thread_ts=parent_ts)
+        return
 
     statuses, error = fetch_printer_statuses()
 
@@ -197,15 +283,29 @@ def handle_mention(event, say, client):
         say(text=":printer: No printers have been discovered yet.", thread_ts=parent_ts)
         return
 
-    if with_screenshot:
-        header = f":printer: Fetching status and snapshots for {len(statuses)} printer(s)…"
-    else:
-        header = f":printer: Fetching status for {len(statuses)} printer(s)…"
-    say(text=header, thread_ts=parent_ts)
+    selected = select_printers(statuses, filters)
+
+    if not selected:
+        known = ", ".join(printer_label(ip, p) for ip, p in statuses.items())
+        say(
+            text=(
+                f":mag: No printers matched {', '.join(filters)}.\n"
+                f"_Known printers: {known}_\n"
+                "_Say `help` for usage._"
+            ),
+            thread_ts=parent_ts,
+        )
+        return
+
+    what = "status and snapshots" if with_screenshot else "status"
+    header = f":printer: Fetching {what} for {len(selected)} printer(s)"
+    if filters:
+        header += f" matching {', '.join(filters)}"
+    say(text=f"{header}…", thread_ts=parent_ts)
 
     # Capture serially: the Pi Zero W is single-core, so concurrent ffmpeg decodes
     # would contend and slow every capture. One printer at a time keeps each fast.
-    for ip, printer in statuses.items():
+    for ip, printer in selected.items():
         post_printer(client, channel, parent_ts, ip, printer, with_screenshot)
 
 
