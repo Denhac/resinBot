@@ -1,11 +1,19 @@
 import io
 import os
 import re
+import threading
+import time
 import requests
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 PRINTER_SERVER_URL = os.environ.get("PRINTER_SERVER_URL", "http://localhost:5000")
+
+# Where print started/paused/resumed/completed/cancelled/error posts go. Set it
+# empty to turn them off. The bot must be a member of the channel.
+NOTIFY_CHANNEL = os.environ.get("NOTIFY_CHANNEL", "#bots")
+# The server caches each printer's latest status, so polling it is cheap.
+NOTIFY_POLL_SECONDS = 10
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
@@ -93,6 +101,16 @@ PRINT_ERRORS = {
 }
 
 
+def format_duration(ms) -> str:
+    """Render a millisecond tick count as "2h 5m" / "5m"; None if it isn't a number."""
+    try:
+        total_min = max(0, int(ms)) // 1000 // 60
+    except (TypeError, ValueError):
+        return None
+    hours, mins = divmod(total_min, 60)
+    return f"{hours}h {mins}m" if hours else f"{mins}m"
+
+
 def printer_label(ip: str, printer: dict) -> str:
     name = printer.get("name")
     machine = printer.get("machine_name")
@@ -151,9 +169,7 @@ def format_printer_text(ip: str, printer: dict) -> str:
         total_ticks = print_info.get("TotalTicks")
         if current_ticks is not None and total_ticks:
             try:
-                remaining_min = max(0, int(total_ticks) - int(current_ticks)) // 1000 // 60
-                hours, mins = divmod(remaining_min, 60)
-                time_str = f"{hours}h {mins}m" if hours else f"{mins}m"
+                time_str = format_duration(int(total_ticks) - int(current_ticks))
                 lines.append(f"*Time remaining:* ~{time_str}")
             except ValueError:
                 pass
@@ -369,7 +385,178 @@ def handle_mention(event, say, client):
         post_printer(client, channel, parent_ts, ip, printer, with_screenshot)
 
 
+# PrintInfo.Status codes that decide a print's phase. The v3.0.0 spec stops at 10,
+# but Saturn firmware also sends codes the open-source clients disagree on: 10 is
+# "file checking" (spec) or "stopping" (mslicer), 13 "canceled" or "printing", 16
+# "complete" or "preheating". Only codes every source agrees on are trusted here;
+# anything else counts as printing, and the layer count settles how a print ended.
+PAUSED_CODES = {5, 6}  # pausing, paused
+CANCELLED_CODES = {7, 8}  # stopping, stopped
+COMPLETED_CODES = {9}
+FILE_CHECKING = 10
+ACTIVE_PHASES = {"printing", "paused"}
+
+
+def layers_done(info: dict) -> bool:
+    try:
+        total = int(info.get("TotalLayer") or 0)
+        return total > 0 and int(info.get("CurrentLayer") or 0) >= total
+    except (TypeError, ValueError):
+        return False
+
+
+def print_phase(inner: dict):
+    """Classify a status as idle, busy, printing, paused, completed, or cancelled.
+
+    "busy" is machine work that isn't a print (file transfer, exposure test,
+    self-check) plus the pre-print file check. Returns None before any status
+    has arrived.
+    """
+    codes = inner.get("CurrentStatus")
+    if codes is None:
+        return None
+    codes = set(codes) if isinstance(codes, list) else {codes}
+    # A list can pair printing (1) with other work, e.g. a file upload mid-print.
+    if 1 not in codes:
+        return "idle" if codes <= {0} else "busy"
+    info = inner.get("PrintInfo") or {}
+    sub = info.get("Status")
+    if sub in PAUSED_CODES:
+        return "paused"
+    if sub in CANCELLED_CODES:
+        return "cancelled"
+    if sub in COMPLETED_CODES or layers_done(info):
+        return "completed"
+    if sub == FILE_CHECKING:
+        return "busy"
+    return "printing"
+
+
+class PrintWatcher:
+    """Turns successive /status snapshots into the events worth posting.
+
+    A printer's first snapshot only records where it is, so restarts never
+    announce prints already underway. Completed/cancelled post only when a print
+    was in progress, and idle never posts on its own.
+    """
+
+    def __init__(self):
+        # key -> {"active": "printing" | "paused" | None, "error": int}
+        self._printers = {}
+
+    def update(self, statuses: dict) -> list:
+        """Returns [(event, name, print_info)] for this snapshot's transitions."""
+        events = []
+        for ip, printer in statuses.items():
+            raw = printer.get("status") or {}
+            inner = raw.get("Status", raw)
+            phase = print_phase(inner) if inner else None
+            if phase is None:
+                continue
+            info = inner.get("PrintInfo") or {}
+            error = info.get("ErrorNumber") or 0
+            key = printer.get("mainboard_id") or ip
+            name = printer.get("name") or printer.get("machine_name") or ip
+
+            state = self._printers.get(key)
+            if state is None:
+                # A busy printer could be mid-print or about to start one; wait
+                # for a phase that says which before taking the baseline.
+                if phase != "busy":
+                    self._printers[key] = {
+                        "active": phase if phase in ACTIVE_PHASES else None,
+                        "error": error,
+                    }
+                continue
+
+            event = self._transition(state, phase, info)
+            if event:
+                events.append((event, name, info))
+            if error and error != state["error"]:
+                events.append(("error", name, info))
+            state["error"] = error
+        return events
+
+    @staticmethod
+    def _transition(state: dict, phase: str, info: dict):
+        active = state["active"]
+        if phase in ACTIVE_PHASES:
+            state["active"] = phase
+            if active is None:
+                return "started"
+            if active != phase:
+                return "paused" if phase == "paused" else "resumed"
+            return None
+        if phase == "busy":
+            return None
+        state["active"] = None
+        if active is None:
+            return None
+        if phase == "idle":
+            # The printer can drop straight to idle, skipping a completed state
+            # we'd see; the leftover print info says how it ended.
+            done = info.get("Status") in COMPLETED_CODES or layers_done(info)
+            return "completed" if done else "cancelled"
+        return phase
+
+
+def format_event_text(event: str, name: str, info: dict) -> str:
+    filename = info.get("Filename")
+    what = f" `{filename}`" if filename else ""
+    current, total = info.get("CurrentLayer"), info.get("TotalLayer")
+    at_layer = f" at layer {current}/{total}" if current is not None and total else ""
+
+    if event == "started":
+        details = []
+        if total:
+            details.append(f"{total} layers")
+        try:
+            remaining = int(info.get("TotalTicks")) - int(info.get("CurrentTicks"))
+            if remaining > 0:
+                details.append(f"~{format_duration(remaining)}")
+        except (TypeError, ValueError):
+            pass
+        suffix = f" ({', '.join(details)})" if details else ""
+        return f":printer: *{name}* started printing{what}{suffix}"
+    if event == "paused":
+        return f":double_vertical_bar: *{name}* paused{what}{at_layer}"
+    if event == "resumed":
+        return f":arrow_forward: *{name}* resumed{what}{at_layer}"
+    if event == "completed":
+        took = format_duration(info.get("CurrentTicks"))
+        return f":white_check_mark: *{name}* finished{what}" + (f" in ~{took}" if took else "")
+    if event == "cancelled":
+        return f":octagonal_sign: *{name}* cancelled{what}{at_layer}"
+    err = info.get("ErrorNumber")
+    with_file = f" with{what}" if what else ""
+    return f":warning: *{name}* error{with_file}: {PRINT_ERRORS.get(err, f'code {err}')}"
+
+
+def watch_printers(client):
+    """Poll the server forever, posting major print transitions to NOTIFY_CHANNEL."""
+    watcher = PrintWatcher()
+    while True:
+        events = []
+        try:
+            statuses, _ = fetch_printer_statuses()
+            # Server down or no printers: keep the last-known state and retry.
+            events = watcher.update(statuses or {})
+        except Exception as e:
+            print(f"Printer watch error: {e}")
+        for event in events:
+            text = format_event_text(*event)
+            print(f"Posting to {NOTIFY_CHANNEL}: {text}")
+            try:
+                client.chat_postMessage(channel=NOTIFY_CHANNEL, text=text)
+            except Exception as e:
+                print(f"Failed to post to {NOTIFY_CHANNEL}: {e}")
+        time.sleep(NOTIFY_POLL_SECONDS)
+
+
 if __name__ == "__main__":
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
+    if NOTIFY_CHANNEL:
+        threading.Thread(target=watch_printers, args=(app.client,), daemon=True).start()
+        print(f"Posting print transitions to {NOTIFY_CHANNEL}.")
     print("Slack bot started.")
     handler.start()
