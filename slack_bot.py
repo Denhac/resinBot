@@ -554,9 +554,12 @@ def post_event(client, channel_id, event, ip, name, info):
     text = format_event_text(event, name, info)
     jpg = None
     if event == "completed":
-        jpg, err = fetch_screenshot(ip)
+        jpg, damage, err = fetch_screenshot(ip)
         if not jpg:
             text += f"\n_:camera_with_flash: Screenshot unavailable: {err}_"
+        elif damage > 0:
+            text += (f"\n_:warning: The camera's WiFi kept dropping packets, so no clean frame"
+                     f" came through; about {damage:.0%} of this one is smeared._")
     print(f"Posting to {NOTIFY_CHANNEL}: {text}")
 
     if not jpg:
