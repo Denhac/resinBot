@@ -201,12 +201,12 @@ def format_refresh_text(result: dict) -> str:
     removed = result.get("removed") or {}
 
     if kept:
-        lines = [f":printer: Discovery done — tracking {len(kept)} printer(s):"]
+        lines = [f":resin-printer: Discovery done — tracking {len(kept)} printer(s):"]
         for ip, printer in kept.items():
             note = REFRESH_NOTES.get(printer.get("state"))
             lines.append(f"• {printer_label(ip, printer)}" + (f" — _{note}_" if note else ""))
     else:
-        lines = [":printer: Discovery found no printers."]
+        lines = [":resin-printer: Discovery found no printers."]
 
     if removed:
         gone = ", ".join(printer_label(ip, p) for ip, p in removed.items())
@@ -261,7 +261,7 @@ def _keyword_list(keywords) -> str:
 def help_text() -> str:
     """Usage summary, generated from the keyword sets so it can't drift."""
     return "\n".join([
-        ":printer: *resinBot* — mention me with optional keywords.",
+        ":resin-printer: *resinBot* — mention me with optional keywords.",
         "",
         f"*Status* — just mention me (or say {_keyword_list(STATUS_KEYWORDS)}) "
         "for every printer's status.",
@@ -354,7 +354,7 @@ def handle_mention(event, say, client):
 
     if not statuses:
         say(
-            text=":printer: No printers have been discovered yet. Say `refresh` to scan again.",
+            text=":resin-printer: No printers have been discovered yet. Say `refresh` to scan again.",
             thread_ts=parent_ts,
         )
         return
@@ -374,7 +374,7 @@ def handle_mention(event, say, client):
         return
 
     what = "status and snapshots" if with_screenshot else "status"
-    header = f":printer: Fetching {what} for {len(selected)} printer(s)"
+    header = f":resin-printer: Fetching {what} for {len(selected)} printer(s)"
     if filters:
         header += f" matching {', '.join(filters)}"
     say(text=f"{header}…", thread_ts=parent_ts)
@@ -517,7 +517,7 @@ def format_event_text(event: str, name: str, info: dict) -> str:
         except (TypeError, ValueError):
             pass
         suffix = f" ({', '.join(details)})" if details else ""
-        return f":printer: *{name}* started printing{what}{suffix}"
+        return f":resin-printer: *{name}* started printing{what}{suffix}"
     if event == "paused":
         return f":double_vertical_bar: *{name}* paused{what}{at_layer}"
     if event == "resumed":
