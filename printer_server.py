@@ -1,5 +1,8 @@
+import contextlib
 import socket
 import json
+import queue
+import re
 import subprocess
 import threading
 import time
@@ -209,107 +212,124 @@ def _send_video_command(ip, mainboard_id, enable):
         except Exception:
             pass
 
-def _run_ffmpeg(video_url, timeout):
-    """Grab a single JPEG keyframe via ffmpeg. Returns bytes, or None on failure/timeout."""
+# How long one screenshot may watch the stream for an intact keyframe. The camera sends
+# one every ~2s, and the first few of a session often arrive torn, so this allows ~25 tries.
+_CAPTURE_SECONDS = 60
+# ffmpeg sessions per screenshot, in case one dies (e.g. RTSP setup fails) before the deadline.
+_CAPTURE_SESSIONS = 3
+
+_SHOWINFO_RE = re.compile(rb"Parsed_showinfo.*\bn:\s*\d+\s+pts:.*\bs:(\d+)x(\d+)")
+_CONCEAL_RE = re.compile(rb"concealing (\d+) DC")
+
+def _frame_damage(stderr, damages):
+    """Parse ffmpeg's log into each output frame's damage, in order, onto the `damages` queue.
+
+    The decoder logs "concealing N DC, ..." when it patches over missing data, and ffmpeg
+    logs "corrupt decoded frame" as it hands such a frame on. showinfo then logs the frame
+    itself, so whatever was reported since the previous frame describes this one. Damage is
+    the fraction of macroblocks concealed (0.0 = intact). Puts None at EOF.
+    """
+    concealed, corrupt = 0, False
+    for line in stderr:
+        if b"corrupt decoded frame" in line:
+            corrupt = True
+        elif m := _CONCEAL_RE.search(line):
+            concealed = int(m.group(1))  # the probe decoder may report first; the last is ours
+        elif m := _SHOWINFO_RE.search(line):
+            total = (int(m.group(1)) // 16) * (int(m.group(2)) // 16)
+            if concealed:
+                damages.put(min(1.0, concealed / total))
+            else:
+                damages.put(1.0 if corrupt else 0.0)  # corrupt with no count: assume the worst
+            concealed, corrupt = 0, False
+    damages.put(None)
+
+def _read_mpjpeg(stream):
+    """Read the next JPEG from ffmpeg's mpjpeg (multipart) output. Returns bytes, or None at EOF."""
+    length = None
+    for line in iter(stream.readline, b""):
+        line = line.strip()
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1])
+        elif not line and length is not None:
+            data = stream.read(length)
+            return data if len(data) == length else None
+    return None
+
+def _stream_keyframes(video_url, seconds):
+    """Yield (jpeg_bytes, damage) for each keyframe one RTSP session delivers within `seconds`."""
     cmd = [
         "ffmpeg",
-        "-nostdin",
-        "-loglevel", "error",
-        "-fflags", "+discardcorrupt",    # drop frames ffmpeg flags as corrupt
+        "-nostdin", "-hide_banner", "-nostats",
+        "-loglevel", "info",             # showinfo and the decoder's concealment reports
         "-rtsp_transport", "udp",        # Elegoo's camera rejects TCP ("Nonmatching transport")
-        "-buffer_size", "8388608",       # big UDP buffer so a 1080p keyframe burst isn't dropped
+        "-buffer_size", "8388608",       # big UDP buffer so a keyframe burst isn't dropped
                                          # (needs net.core.rmem_max raised; see install.sh)
-        "-skip_frame", "nokey",          # decode keyframes only: intra-coded, can't smear
+        "-threads", "1",                 # keeps each decoder report ahead of its own frame
+        "-skip_frame", "nokey",          # decode keyframes only: P-frames would inherit damage
+        "-fpsprobesize", "0",            # don't probe 3 keyframes (~5s) just to guess the fps
         "-i", video_url,
-        "-frames:v", "1",
-        "-f", "image2",
-        "-c:v", "mjpeg",
-        "-q:v", "3",
+        "-vf", "showinfo",               # one log line per frame, delimiting the reports
+        "-fps_mode", "passthrough",      # one JPEG per keyframe, no duplicates
+        "-c:v", "mjpeg", "-q:v", "3",
+        "-f", "mpjpeg",                  # length-prefixed JPEGs...
+        "-flush_packets", "1",           # ...each written out as soon as it's encoded
         "pipe:1",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return None
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         raise RuntimeError("ffmpeg is not installed")
-    return result.stdout or None
-
-# Above this ratio the bottom band is smeared (streaked); clean frames sit well below.
-_STREAK_THRESHOLD = 1.2
-
-def _frame_gray(jpg, w=128, h=72):
-    """Decode JPEG bytes to a small grayscale buffer via ffmpeg (no numpy/PIL on the Pi).
-    Returns a list of h rows, each bytes of length w, or None."""
-    cmd = [
-        "ffmpeg", "-nostdin", "-loglevel", "quiet",
-        "-i", "pipe:0", "-vf", f"scale={w}:{h},format=gray",
-        "-f", "rawvideo", "pipe:1",
-    ]
+    damages = queue.Queue()
+    threading.Thread(target=_frame_damage, args=(proc.stderr, damages), daemon=True).start()
+    # SIGTERM lets ffmpeg send RTSP TEARDOWN, so the camera doesn't hold a dead session.
+    timer = threading.Timer(seconds, proc.terminate)
+    timer.start()
     try:
-        result = subprocess.run(cmd, input=jpg, capture_output=True, timeout=10)
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-    raw = result.stdout
-    if len(raw) < w * h:
-        return None
-    return [raw[r * w:(r + 1) * w] for r in range(h)]
+        while (jpg := _read_mpjpeg(proc.stdout)) is not None:
+            damage = damages.get()
+            yield jpg, 1.0 if damage is None else damage
+    finally:
+        timer.cancel()
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
-def _streak_score(jpg, w=128, h=72):
-    """Vertical-streak score for the bottom band (higher = more streaked).
+def _grab_frame(video_url):
+    """Watch the stream for an intact keyframe. Returns (jpeg_bytes, damage).
 
-    UDP slice loss makes the H.264 decoder repeat rows, giving vertical smear:
-    low vertical change but sharp horizontal stripes. The ratio of horizontal to
-    vertical adjacent-pixel change spikes for streaked frames and stays low both
-    for clean content and for genuinely flat regions. Returns None if undecodable.
+    The camera's 720p keyframes are one ~100+ packet UDP burst, and on a weak WiFi link
+    losing any packet tears the frame: everything below the gap is concealed as vertical
+    streaks. Rather than guess from pixels, trust the decoder's own concealment reports,
+    take the first keyframe it decodes whole, and fall back to the least damaged one.
     """
-    rows = _frame_gray(jpg, w, h)
-    if rows is None:
-        return None
-    r0 = int(h * 0.60)  # bottom 40% — where lost slices land
-    vsum = vcnt = 0
-    for r in range(r0, h):
-        if r == 0:
-            continue
-        prev, cur = rows[r - 1], rows[r]
-        vsum += sum(abs(cur[c] - prev[c]) for c in range(w))
-        vcnt += w
-    hsum = hcnt = 0
-    for r in range(r0, h):
-        cur = rows[r]
-        hsum += sum(abs(cur[c] - cur[c - 1]) for c in range(1, w))
-        hcnt += w - 1
-    band_vert = vsum / vcnt if vcnt else 0.0
-    band_horiz = hsum / hcnt if hcnt else 0.0
-    return band_horiz / (band_vert + 1.0)
-
-def _grab_frame(video_url, timeout=30, attempts=4):
-    """Grab a keyframe, rejecting bottom-streaked frames caused by UDP slice loss.
-
-    Each candidate is scored for vertical smear; the first clean frame is
-    returned, otherwise the least-streaked of N attempts.
-    """
-    best = None
-    best_score = None
-    for _ in range(attempts):
-        jpg = _run_ffmpeg(video_url, timeout)
-        if not jpg:
-            continue
-        score = _streak_score(jpg)
-        if score is None:
-            if best is None:        # can't analyze; keep as last-resort fallback
-                best, best_score = jpg, float("inf")
-            continue
-        if score <= _STREAK_THRESHOLD:
-            return jpg              # clean
-        if best_score is None or score < best_score:
-            best, best_score = jpg, score
+    deadline = time.monotonic() + _CAPTURE_SECONDS
+    best, best_damage, tries = None, None, 0
+    for _ in range(_CAPTURE_SESSIONS):
+        remaining = deadline - time.monotonic()
+        if remaining < 5:
+            break
+        with contextlib.closing(_stream_keyframes(video_url, remaining)) as frames:
+            for jpg, damage in frames:
+                tries += 1
+                if damage == 0:
+                    return jpg, 0.0
+                if best is None or damage < best_damage:
+                    best, best_damage = jpg, damage
     if best is None:
-        raise RuntimeError(f"ffmpeg produced no frame after {attempts} attempts")
-    return best
+        raise RuntimeError("ffmpeg produced no frame")
+    print(f"No intact keyframe from {video_url} in {tries} tries; "
+          f"using the least damaged ({best_damage:.0%} concealed)")
+    return best, best_damage
 
 def capture_screenshot(ip, mainboard_id):
-    """Enable the printer's video stream, grab one frame via ffmpeg, disable. Returns JPEG bytes."""
+    """Enable the printer's video stream, grab one frame via ffmpeg, disable.
+
+    Returns (jpeg_bytes, damage), damage being the fraction of the frame concealed.
+    """
     response = _send_video_command(ip, mainboard_id, enable=True)
     if not response:
         raise RuntimeError("No response to video stream request")
@@ -387,14 +407,12 @@ def get_screenshot(ip):
 
     mainboard_id = printer.get("mainboard_id")
     try:
-        jpg = capture_screenshot(ip, mainboard_id)
+        jpg, damage = capture_screenshot(ip, mainboard_id)
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
-    if jpg is None:
-        return jsonify({"error": "Failed to capture frame from RTSP stream"}), 504
-
-    return Response(jpg, mimetype="image/jpeg")
+    # Above 0, no intact frame arrived in time and this is the least damaged one.
+    return Response(jpg, mimetype="image/jpeg", headers={"X-Frame-Damage": f"{damage:.3f}"})
 
 @app.route('/refresh', methods=['POST'])
 def refresh():

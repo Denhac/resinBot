@@ -50,23 +50,30 @@ def request_refresh():
 
 
 def fetch_screenshot(ip):
-    """Returns (jpeg_bytes, error_message)."""
+    """Returns (jpeg_bytes, damage, error_message).
+
+    damage is the fraction of the frame the decoder had to conceal: above 0 when no
+    intact frame came through and this is the least damaged one.
+    """
     try:
-        # Capture enables video, then grabs/scores up to 4 keyframes (rejecting streaked
-        # ones) before disabling. On the single-core Pi a weak-link printer can need
-        # several retries, so this must exceed the server's worst case (4 x 30s + overhead).
-        resp = requests.get(f"{PRINTER_SERVER_URL}/screenshot/{ip}", timeout=180)
+        # Capture enables video, watches keyframes for up to 60s for an intact one, then
+        # disables, so this must exceed that plus the enable/disable round trips.
+        resp = requests.get(f"{PRINTER_SERVER_URL}/screenshot/{ip}", timeout=120)
         if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image/"):
-            return resp.content, None
+            try:
+                damage = float(resp.headers.get("X-Frame-Damage", 0))
+            except ValueError:
+                damage = 0.0
+            return resp.content, damage, None
         try:
             err = resp.json().get("error", f"HTTP {resp.status_code}")
         except ValueError:
             err = f"HTTP {resp.status_code}"
-        return None, err
+        return None, 0.0, err
     except requests.exceptions.Timeout:
-        return None, "Screenshot request timed out."
+        return None, 0.0, "Screenshot request timed out."
     except Exception as e:
-        return None, str(e)
+        return None, 0.0, str(e)
 
 
 # SDCP v3.0.0 enums
@@ -309,9 +316,12 @@ def post_printer(client, channel, thread_ts, ip, printer, with_screenshot):
         client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=text)
         return
 
-    jpg, err = fetch_screenshot(ip)
+    jpg, damage, err = fetch_screenshot(ip)
 
     if jpg:
+        if damage > 0:
+            text += (f"\n_:warning: The camera's WiFi kept dropping packets, so no clean frame"
+                     f" came through; about {damage:.0%} of this one is smeared._")
         client.files_upload_v2(
             channel=channel,
             thread_ts=thread_ts,
@@ -447,7 +457,7 @@ class PrintWatcher:
         self._printers = {}
 
     def update(self, statuses: dict) -> list:
-        """Returns [(event, name, print_info)] for this snapshot's transitions."""
+        """Returns [(event, ip, name, print_info)] for this snapshot's transitions."""
         events = []
         for ip, printer in statuses.items():
             raw = printer.get("status") or {}
@@ -473,9 +483,9 @@ class PrintWatcher:
 
             event = self._transition(state, phase, info)
             if event:
-                events.append((event, name, info))
+                events.append((event, ip, name, info))
             if error and error != state["error"]:
-                events.append(("error", name, info))
+                events.append(("error", ip, name, info))
             state["error"] = error
         return events
 
@@ -534,9 +544,50 @@ def format_event_text(event: str, name: str, info: dict) -> str:
     return f":warning: *{name}* error{with_file}: {PRINT_ERRORS.get(err, f'code {err}')}"
 
 
+def post_event(client, channel_id, event, ip, name, info):
+    """Post one event to NOTIFY_CHANNEL, with a camera frame of a completed print.
+
+    Returns the channel's ID (None until known). File uploads need the ID, but
+    the channel is configured by name, so the ID is learned from the response
+    to a plain post.
+    """
+    text = format_event_text(event, name, info)
+    jpg = None
+    if event == "completed":
+        jpg, err = fetch_screenshot(ip)
+        if not jpg:
+            text += f"\n_:camera_with_flash: Screenshot unavailable: {err}_"
+    print(f"Posting to {NOTIFY_CHANNEL}: {text}")
+
+    if not jpg:
+        return client.chat_postMessage(channel=NOTIFY_CHANNEL, text=text)["channel"]
+    if channel_id is None:
+        # Nothing posted since startup, so the ID is still unknown: post the
+        # text to learn it, and let the photo follow as its own message.
+        channel_id = client.chat_postMessage(channel=NOTIFY_CHANNEL, text=text)["channel"]
+        text = None
+    try:
+        client.files_upload_v2(
+            channel=channel_id,
+            file=io.BytesIO(jpg),
+            filename=f"{ip.replace('.', '_')}.jpg",
+            title=name,
+            initial_comment=text,
+        )
+    except Exception as e:
+        print(f"Failed to upload screenshot to {NOTIFY_CHANNEL}: {e}")
+        if text:  # the completion itself hasn't been posted yet
+            client.chat_postMessage(
+                channel=channel_id,
+                text=f"{text}\n_:camera_with_flash: Screenshot upload failed: {e}_",
+            )
+    return channel_id
+
+
 def watch_printers(client):
     """Poll the server forever, posting major print transitions to NOTIFY_CHANNEL."""
     watcher = PrintWatcher()
+    channel_id = None
     while True:
         events = []
         try:
@@ -545,11 +596,11 @@ def watch_printers(client):
             events = watcher.update(statuses or {})
         except Exception as e:
             print(f"Printer watch error: {e}")
+        # A completed post's capture can take a couple of minutes; the next poll
+        # still catches any transitions that happen meanwhile.
         for event in events:
-            text = format_event_text(*event)
-            print(f"Posting to {NOTIFY_CHANNEL}: {text}")
             try:
-                client.chat_postMessage(channel=NOTIFY_CHANNEL, text=text)
+                channel_id = post_event(client, channel_id, *event)
             except Exception as e:
                 print(f"Failed to post to {NOTIFY_CHANNEL}: {e}")
         time.sleep(NOTIFY_POLL_SECONDS)

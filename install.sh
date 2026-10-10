@@ -68,6 +68,20 @@ echo "net.core.rmem_max = 8388608" > "$SYSCTL_FILE"
 sysctl -w net.core.rmem_max=8388608 >/dev/null
 echo "Set net.core.rmem_max=8388608 ($SYSCTL_FILE)"
 
+# Turn off WiFi power saving. While the Pi dozes, the access point buffers frames for it
+# and loses much of each camera keyframe's packet burst, so screenshots come through torn.
+# The NetworkManager default sticks across reconnects; iw applies it to the live link.
+if [[ -d /etc/NetworkManager/conf.d ]]; then
+  printf '[connection]\nwifi.powersave = 2\n' > /etc/NetworkManager/conf.d/99-resinbot-wifi.conf
+  nmcli general reload conf 2>/dev/null || true  # so a reconnect before reboot honors it
+  echo "Disabled WiFi power saving for NetworkManager connections"
+fi
+if command -v iw >/dev/null; then
+  for iface in $(iw dev | awk '$1 == "Interface" { print $2 }'); do
+    iw dev "$iface" set power_save off && echo "Disabled power saving on $iface"
+  done
+fi
+
 # Render and install unit files with the resolved user + directory.
 for unit in resinbot-server resinbot-bot; do
   sed -e "s|__USER__|$SERVICE_USER|g" -e "s|__DIR__|$DIR|g" \
