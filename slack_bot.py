@@ -390,8 +390,10 @@ def handle_mention(event, say, client):
 # "file checking" (spec) or "stopping" (mslicer), 13 "canceled" or "printing", 16
 # "complete" or "preheating". Only codes every source agrees on are trusted here;
 # anything else counts as printing, and the layer count settles how a print ended.
+# 7 (stopping) isn't a cancel: Saturn 4 Ultra V1.5.2 sends it briefly on a normal
+# finish (7 at 200/200 layers, then idle with 9).
 PAUSED_CODES = {5, 6}  # pausing, paused
-CANCELLED_CODES = {7, 8}  # stopping, stopped
+CANCELLED_CODES = {8}  # stopped
 COMPLETED_CODES = {9}
 FILE_CHECKING = 10
 ACTIVE_PHASES = {"printing", "paused"}
@@ -423,10 +425,10 @@ def print_phase(inner: dict):
     sub = info.get("Status")
     if sub in PAUSED_CODES:
         return "paused"
-    if sub in CANCELLED_CODES:
-        return "cancelled"
     if sub in COMPLETED_CODES or layers_done(info):
         return "completed"
+    if sub in CANCELLED_CODES:
+        return "cancelled"
     if sub == FILE_CHECKING:
         return "busy"
     return "printing"
