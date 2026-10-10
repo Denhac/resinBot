@@ -9,11 +9,18 @@ from websocket import create_connection, WebSocketTimeoutException
 
 app = Flask(__name__)
 
-# {ip: {"status": {}, "ws": connection, "mainboard_id": str}}
+# {ip: {"status": {}, "attributes": {}, "ws": connection, "thread": Thread,
+#       "mainboard_id": str, "name": str, "machine_name": str}}
 printers = {}
 printers_lock = threading.Lock()
+# Serializes discovery so overlapping refreshes can't both reconcile the same replies.
+discovery_lock = threading.Lock()
 
 def discover_printers():
+    """Broadcast the SDCP probe and collect replies until none arrive for 5s.
+
+    Returns {ip: {"mainboard_id", "name", "machine_name"}} for every responder.
+    """
     udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     udp_socket.settimeout(5)
@@ -21,6 +28,7 @@ def discover_printers():
     message = "M99999".encode('utf-8')
     udp_socket.sendto(message, ("<broadcast>", 3000))
 
+    found = {}
     try:
         while True:
             response, addr = udp_socket.recvfrom(1024)
@@ -35,23 +43,70 @@ def discover_printers():
             except (ValueError, UnicodeDecodeError):
                 pass
 
-            with printers_lock:
-                if ip not in printers:
-                    printers[ip] = {
-                        "status": {},
-                        "attributes": {},
-                        "ws": None,
-                        "mainboard_id": mainboard_id,
-                        "name": name,
-                        "machine_name": machine_name,
-                    }
-                    print(f"Printer found: {name or machine_name or ip} at {ip} (mainboard: {mainboard_id})")
+            if ip not in found:
+                found[ip] = {
+                    "mainboard_id": mainboard_id,
+                    "name": name,
+                    "machine_name": machine_name,
+                }
+                print(f"Printer found: {name or machine_name or ip} at {ip} (mainboard: {mainboard_id})")
     except socket.timeout:
         pass
     finally:
         udp_socket.close()
 
-    print(f"Discovery complete. Found {len(printers)} printer(s).")
+    print(f"Discovery complete. Found {len(found)} printer(s).")
+    return found
+
+def _connection_alive(printer):
+    thread = printer.get("thread")
+    return thread is not None and thread.is_alive()
+
+def _start_connection(ip):
+    """Start the websocket thread for a known printer. Caller holds printers_lock."""
+    thread = threading.Thread(target=connect_to_printer, args=(ip,), daemon=True)
+    printers[ip]["thread"] = thread
+    thread.start()
+
+def refresh_printers():
+    """Run discovery and reconcile the known printers with whoever answered.
+
+    New responders are added and connected, and responders whose websocket thread
+    has exited are reconnected. A printer that neither answered nor still holds a
+    live connection is dropped: it's powered off or has moved to another IP.
+
+    Returns {"printers": {ip: view}, "removed": {ip: view}}, where each kept
+    printer's view carries a "state": "new", "reconnected", "active", or
+    "no_reply" (kept because its connection is still up).
+    """
+    with discovery_lock:
+        found = discover_printers()
+        result = {"printers": {}, "removed": {}}
+        with printers_lock:
+            for ip, info in found.items():
+                printer = printers.get(ip)
+                if printer is None:
+                    printers[ip] = {"status": {}, "attributes": {}, "ws": None, "thread": None, **info}
+                    state = "new"
+                else:
+                    # A reply without names mustn't erase ones learned from attributes.
+                    printer.update({k: v for k, v in info.items() if v})
+                    state = "active" if _connection_alive(printer) else "reconnected"
+                if state != "active":
+                    if state == "reconnected":
+                        print(f"Reconnecting to printer at {ip}")
+                    _start_connection(ip)
+                result["printers"][ip] = dict(_printer_view(printers[ip]), state=state)
+
+            for ip in [ip for ip in printers if ip not in found]:
+                view = _printer_view(printers[ip])
+                if _connection_alive(printers[ip]):
+                    result["printers"][ip] = dict(view, state="no_reply")
+                else:
+                    del printers[ip]
+                    result["removed"][ip] = view
+                    print(f"Dropped printer at {ip}: no discovery reply and no connection")
+    return result
 
 def _request_payload(mainboard_id, cmd, data=None):
     """Build an SDCP request envelope. Returns (json_string, request_id)."""
@@ -275,13 +330,15 @@ def capture_screenshot(ip, mainboard_id):
         except Exception as e:
             print(f"Failed to disable video stream for {ip}: {e}")
 
-def _printer_view(printer, field):
-    return {
+def _printer_view(printer, field=None):
+    view = {
         "name": printer.get("name"),
         "machine_name": printer.get("machine_name"),
         "mainboard_id": printer.get("mainboard_id"),
-        field: printer.get(field, {}),
     }
+    if field:
+        view[field] = printer.get(field, {})
+    return view
 
 @app.route('/status', methods=['GET'])
 def get_all_status():
@@ -339,10 +396,11 @@ def get_screenshot(ip):
 
     return Response(jpg, mimetype="image/jpeg")
 
+@app.route('/refresh', methods=['POST'])
+def refresh():
+    """Re-run discovery now: pick up new printers, reconnect dropped ones, forget gone ones."""
+    return jsonify(refresh_printers())
+
 if __name__ == "__main__":
-    discover_printers()
-    with printers_lock:
-        ips = list(printers.keys())
-    for ip in ips:
-        threading.Thread(target=connect_to_printer, args=(ip,), daemon=True).start()
+    refresh_printers()
     app.run(host="0.0.0.0", port=5000)

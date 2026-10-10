@@ -13,12 +13,30 @@ app = App(token=os.environ["SLACK_BOT_TOKEN"])
 def fetch_printer_statuses():
     try:
         resp = requests.get(f"{PRINTER_SERVER_URL}/status", timeout=5)
+        if resp.status_code == 503:  # server is up but hasn't discovered any printers
+            return {}, None
         resp.raise_for_status()
         return resp.json(), None
     except requests.exceptions.ConnectionError:
         return None, "Could not reach the printer server."
     except requests.exceptions.Timeout:
         return None, "Printer server timed out."
+    except Exception as e:
+        return None, str(e)
+
+
+def request_refresh():
+    """Have the server re-run discovery. Returns (result, error_message)."""
+    try:
+        # Discovery listens until replies stop for 5s, and waits out any discovery
+        # already running, so allow well beyond that.
+        resp = requests.post(f"{PRINTER_SERVER_URL}/refresh", timeout=60)
+        resp.raise_for_status()
+        return resp.json(), None
+    except requests.exceptions.ConnectionError:
+        return None, "Could not reach the printer server."
+    except requests.exceptions.Timeout:
+        return None, "Printer discovery timed out."
     except Exception as e:
         return None, str(e)
 
@@ -154,6 +172,32 @@ def format_printer_text(ip: str, printer: dict) -> str:
     return "\n".join(lines)
 
 
+# How each refresh state from the server is annotated; "active" needs no note.
+REFRESH_NOTES = {
+    "new": "newly found",
+    "reconnected": "reconnecting",
+    "no_reply": "didn't answer, but its connection is still up",
+}
+
+
+def format_refresh_text(result: dict) -> str:
+    kept = result.get("printers") or {}
+    removed = result.get("removed") or {}
+
+    if kept:
+        lines = [f":printer: Discovery done — tracking {len(kept)} printer(s):"]
+        for ip, printer in kept.items():
+            note = REFRESH_NOTES.get(printer.get("state"))
+            lines.append(f"• {printer_label(ip, printer)}" + (f" — _{note}_" if note else ""))
+    else:
+        lines = [":printer: Discovery found no printers."]
+
+    if removed:
+        gone = ", ".join(printer_label(ip, p) for ip, p in removed.items())
+        lines.append(f"_Dropped {len(removed)} printer(s) that stopped responding: {gone}_")
+    return "\n".join(lines)
+
+
 # Any of these ask for a camera frame alongside the status.
 SCREENSHOT_KEYWORDS = {"screenshot", "webcam", "cam", "snapshot", "picture"}
 
@@ -163,7 +207,9 @@ STATUS_KEYWORDS = {"status", "all"}
 
 HELP_KEYWORDS = {"help", "usage", "commands"}
 
-COMMAND_KEYWORDS = SCREENSHOT_KEYWORDS | STATUS_KEYWORDS | HELP_KEYWORDS
+REFRESH_KEYWORDS = {"refresh", "rediscover", "rescan"}
+
+COMMAND_KEYWORDS = SCREENSHOT_KEYWORDS | STATUS_KEYWORDS | HELP_KEYWORDS | REFRESH_KEYWORDS
 
 # Slack renders mentions/links/channels as <...> entities; none are printer names.
 _ENTITY_RE = re.compile(r"<[^>]*>")
@@ -173,7 +219,7 @@ _TOKEN_RE = re.compile(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?")
 
 
 def parse_command(text: str):
-    """Split mention text into (show_help, with_screenshot, name_filters).
+    """Split mention text into (show_help, refresh, with_screenshot, name_filters).
 
     Every token that isn't a recognized command keyword is treated as a
     case-insensitive substring filter on printer names.
@@ -182,13 +228,14 @@ def parse_command(text: str):
     tokens = _TOKEN_RE.findall(body)
 
     show_help = any(t in HELP_KEYWORDS for t in tokens)
+    refresh = any(t in REFRESH_KEYWORDS for t in tokens)
     with_screenshot = any(t in SCREENSHOT_KEYWORDS for t in tokens)
 
     filters = []
     for token in tokens:
         if token not in COMMAND_KEYWORDS and token not in filters:
             filters.append(token)
-    return show_help, with_screenshot, filters
+    return show_help, refresh, with_screenshot, filters
 
 
 def _keyword_list(keywords) -> str:
@@ -206,12 +253,16 @@ def help_text() -> str:
         "*Pick printers* — any other word filters by printer name, model, or IP. "
         "Matching is case-insensitive and partial, and multiple terms are combined "
         "(any match wins).",
+        f"*Refresh* — {_keyword_list(REFRESH_KEYWORDS)} re-scans the network for printers: "
+        "finds ones turned on since startup, reconnects dropped ones, and forgets ones "
+        "that are gone.",
         f"*Help* — {_keyword_list(HELP_KEYWORDS)}.",
         "",
         "_Examples:_",
         "• `@resinBot` — status for all printers",
         "• `@resinBot left` — status for printers whose name contains \"left\"",
         "• `@resinBot cam left right` — snapshots from both printers",
+        "• `@resinBot refresh` — look for new or missing printers",
     ])
 
 
@@ -267,10 +318,16 @@ def handle_mention(event, say, client):
     # Reply in-thread if the mention was in a thread, else start a new thread on our header.
     parent_ts = event.get("thread_ts") or event["ts"]
 
-    show_help, with_screenshot, filters = parse_command(event.get("text", ""))
+    show_help, refresh, with_screenshot, filters = parse_command(event.get("text", ""))
 
     if show_help:
         say(text=help_text(), thread_ts=parent_ts)
+        return
+
+    if refresh:
+        say(text=":mag: Scanning the network for printers…", thread_ts=parent_ts)
+        result, error = request_refresh()
+        say(text=f":warning: {error}" if error else format_refresh_text(result), thread_ts=parent_ts)
         return
 
     statuses, error = fetch_printer_statuses()
@@ -280,7 +337,10 @@ def handle_mention(event, say, client):
         return
 
     if not statuses:
-        say(text=":printer: No printers have been discovered yet.", thread_ts=parent_ts)
+        say(
+            text=":printer: No printers have been discovered yet. Say `refresh` to scan again.",
+            thread_ts=parent_ts,
+        )
         return
 
     selected = select_printers(statuses, filters)
@@ -291,7 +351,7 @@ def handle_mention(event, say, client):
             text=(
                 f":mag: No printers matched {', '.join(filters)}.\n"
                 f"_Known printers: {known}_\n"
-                "_Say `help` for usage._"
+                "_Say `refresh` to scan for missing printers, or `help` for usage._"
             ),
             thread_ts=parent_ts,
         )
