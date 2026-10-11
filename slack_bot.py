@@ -590,7 +590,9 @@ def post_event(client, channel_id, event, ip, name, info):
 def watch_printers(client):
     """Poll the server forever, posting major print transitions to NOTIFY_CHANNEL."""
     watcher = PrintWatcher()
-    channel_id = None
+    # Configured as an ID, the channel is known from the start; as a name, it's
+    # learned from the first post.
+    channel_id = NOTIFY_CHANNEL if re.fullmatch(r"[CGD][A-Z0-9]{6,}", NOTIFY_CHANNEL) else None
     while True:
         events = []
         try:
