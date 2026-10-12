@@ -118,6 +118,29 @@ def format_duration(ms) -> str:
     return f"{hours}h {mins}m" if hours else f"{mins}m"
 
 
+def format_progress(info: dict) -> str:
+    """Render layer progress as "80/200 layers (40.0%)"; None without layer counts."""
+    current, total = info.get("CurrentLayer"), info.get("TotalLayer")
+    if current is None or not total:
+        return None
+    try:
+        pct = round(int(current) / int(total) * 100, 1)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return f"{current}/{total} layers ({pct}%)"
+
+
+def format_eta(ms) -> str:
+    """Render the time `ms` from now as a Slack date, shown in each reader's own timezone."""
+    eta = time.time() + ms / 1000
+    local = time.localtime(eta)
+    if local[:3] == time.localtime()[:3]:
+        token, fallback = "{time}", time.strftime("%-I:%M %p", local)
+    else:
+        token, fallback = "{date_short_pretty} at {time}", time.strftime("%b %-d at %-I:%M %p", local)
+    return f"<!date^{int(eta)}^{token}|{fallback}>"
+
+
 def printer_label(ip: str, printer: dict) -> str:
     name = printer.get("name")
     machine = printer.get("machine_name")
@@ -162,14 +185,9 @@ def format_printer_text(ip: str, printer: dict) -> str:
         if filename:
             lines.append(f"*File:* {filename}")
 
-        current_layer = print_info.get("CurrentLayer")
-        total_layers = print_info.get("TotalLayer")
-        if current_layer is not None and total_layers:
-            try:
-                pct = round(int(current_layer) / int(total_layers) * 100, 1)
-                lines.append(f"*Progress:* {current_layer}/{total_layers} layers ({pct}%)")
-            except (ValueError, ZeroDivisionError):
-                pass
+        progress = format_progress(print_info)
+        if progress:
+            lines.append(f"*Progress:* {progress}")
 
         # No explicit remaining-time field; derive it from tick counters (milliseconds).
         current_ticks = print_info.get("CurrentTicks")
@@ -512,36 +530,55 @@ class PrintWatcher:
         return phase
 
 
-def format_event_text(event: str, name: str, info: dict) -> str:
-    filename = info.get("Filename")
-    what = f" `{filename}`" if filename else ""
-    current, total = info.get("CurrentLayer"), info.get("TotalLayer")
-    at_layer = f" at layer {current}/{total}" if current is not None and total else ""
+# Each event's headline: (emoji, what happened). An error's adds the reason.
+EVENT_HEADLINES = {
+    "started": (":resin-printer:", "started a print"),
+    "paused": (":double_vertical_bar:", "paused"),
+    "resumed": (":arrow_forward:", "resumed"),
+    "completed": (":white_check_mark:", "finished a print"),
+    "cancelled": (":octagonal_sign:", "cancelled"),
+    "error": (":warning:", "error"),
+}
 
+
+def format_event_text(event: str, name: str, info: dict) -> str:
+    """Build a transition post: a headline, then labelled lines like the status reply."""
+    emoji, what = EVENT_HEADLINES[event]
+    if event == "error":
+        err = info.get("ErrorNumber")
+        what += f": {PRINT_ERRORS.get(err, f'code {err}')}"
+    lines = [f"{emoji} *{name}* {what}"]
+
+    filename = info.get("Filename")
+    if filename:
+        lines.append(f"*File:* {filename}")
+
+    current, total = info.get("CurrentLayer"), info.get("TotalLayer")
     if event == "started":
-        details = []
         if total:
-            details.append(f"{total} layers")
+            lines.append(f"*Layers:* {total}")
         try:
             remaining = int(info.get("TotalTicks")) - int(info.get("CurrentTicks"))
-            if remaining > 0:
-                details.append(f"~{format_duration(remaining)}")
         except (TypeError, ValueError):
-            pass
-        suffix = f" ({', '.join(details)})" if details else ""
-        return f":resin-printer: *{name}* started printing{what}{suffix}"
-    if event == "paused":
-        return f":double_vertical_bar: *{name}* paused{what}{at_layer}"
-    if event == "resumed":
-        return f":arrow_forward: *{name}* resumed{what}{at_layer}"
-    if event == "completed":
+            remaining = 0
+        if remaining > 0:
+            lines.append(f"*Estimated time:* ~{format_duration(remaining)}"
+                         f" (done around {format_eta(remaining)})")
+    elif event == "completed":
+        if current is not None and total:
+            lines.append(f"*Layers:* {current}/{total}")
         took = format_duration(info.get("CurrentTicks"))
-        return f":white_check_mark: *{name}* finished{what}" + (f" in ~{took}" if took else "")
-    if event == "cancelled":
-        return f":octagonal_sign: *{name}* cancelled{what}{at_layer}"
-    err = info.get("ErrorNumber")
-    with_file = f" with{what}" if what else ""
-    return f":warning: *{name}* error{with_file}: {PRINT_ERRORS.get(err, f'code {err}')}"
+        if took:
+            # TotalTicks is the slicer's estimate, which the real print time can overrun.
+            estimate = format_duration(info.get("TotalTicks"))
+            note = f" (estimated ~{estimate})" if estimate and estimate != took else ""
+            lines.append(f"*Print time:* ~{took}{note}")
+    else:
+        progress = format_progress(info)
+        if progress:
+            elapsed = format_duration(info.get("CurrentTicks"))
+            lines.append(f"*Progress:* {progress}" + (f", ~{elapsed} in" if elapsed else ""))
+    return "\n".join(lines)
 
 
 def post_event(client, channel_id, event, ip, name, info):
